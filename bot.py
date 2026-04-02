@@ -10,10 +10,13 @@ Telegram File Extractor Bot — 纯 MTProto (Telethon)
 2. 禁止转发 → 下载文件后重新发送
 """
 
+from __future__ import annotations
+
 import os
 import re
 import logging
 import tempfile
+from typing import Optional
 from telethon import TelegramClient, events
 from telethon.tl.types import (
     MessageMediaPhoto,
