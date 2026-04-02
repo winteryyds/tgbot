@@ -1,0 +1,35 @@
+[Unit]
+Description=Telegram File Extractor Bot (MTProto)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=tgbot
+Group=tgbot
+WorkingDirectory=/opt/tgbot
+EnvironmentFile=/etc/tgbot/tgbot.env
+ExecStart=/opt/tgbot/venv/bin/python /opt/tgbot/bot.py
+Restart=on-failure
+RestartSec=10
+
+# 资源限制（对应原 docker-compose 的 mem_limit/cpus）
+MemoryMax=256M
+CPUQuota=50%
+
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/tgbot /tmp
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tgbot
+
+[Install]
+WantedBy=multi-user.target
