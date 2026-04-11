@@ -1,172 +1,348 @@
-# Telegram File Extractor Bot — LXC 部署方案
+# Telegram File Extractor Bot — LXC 轻量稳定版 V2 增强版
 
-> 从 Docker 转换为原生 Linux 二进制部署，适用于 **Proxmox LXC 容器**（Debian/Ubuntu）。  
-> 无需 Docker，资源占用更低，启动更快，与宿主机 kernel 直接交互。
+> 面向 **Proxmox LXC / Debian / Ubuntu** 的 Telegram 媒体提取机器人部署包。  
+> 目标是：**轻量、稳定、低依赖、适合小规格 LXC 长期运行**。
+
+---
+
+## 这次增强了什么
+
+在原先 V2 的基础上，这一版补上了三类你明确提出的能力：
+
+### 1）相册 / 媒体组支持
+
+现在支持处理公开频道 / 群组中的常见媒体组：
+
+- 图片相册
+- 视频相册
+- 图片 + 视频混合相册（Telegram 常见媒体组）
+
+处理策略：
+
+1. **优先尝试直接按媒体组发送**，减少下载和重复上传
+2. **如果源消息禁止转发**，或者直接发送失败：
+   - 自动下载整组媒体
+   - 优先尝试按媒体组重新发送
+   - 如果媒体组发送失败，再自动回退为逐条发送
+
+这样做的原因是：
+
+- 先保留相册体验
+- 但一旦 Telegram 对媒体组重发有限制，也不至于整组任务直接失败
+
+> 说明：媒体组最稳定的支持对象是 **图片 / 视频**。如果遇到 Telegram 特殊分组类型，程序会优先保证“能提取出来”，必要时回退为逐条发送。
+
+---
+
+### 2）更稳的错误提示
+
+增强后，机器人会把很多原本比较生硬的异常，转换成更容易理解的提示，例如：
+
+- 链接里的频道用户名无效
+- 频道是私有的或当前账号无权读取
+- 消息 ID 无效
+- Telegram 限流中，需要等待多少秒
+- 本地磁盘空间不足
+- 请求超时
+- 本地目录权限不足
+
+设计原则是：
+
+- **日志里保留技术细节**，便于运维排错
+- **用户看到的是简洁提示**，避免直接抛 Python 异常
+
+---
+
+### 3）自动清理策略
+
+为了更适合 LXC 小容器，这一版增加了两层清理策略：
+
+#### 第一层：任务级临时目录自动清理
+每次下载 / 转发任务都会使用独立临时目录，任务结束后立即删除。
+
+#### 第二层：后台周期性清理异常遗留文件
+如果机器人在下载中途异常退出，可能留下残留临时文件。增强版会：
+
+- 启动时先清理一次旧临时文件
+- 运行过程中按周期扫描临时目录
+- 删除超出保留时间的旧任务目录
+
+另外，错误状态消息也支持自动延迟删除，减少聊天窗口堆积。
+
+---
+
+## 设计原则
+
+这一版仍然坚持“轻量优先”：
+
+- **Python 依赖只有 Telethon**
+- **ffmpeg 仅作为系统二进制可选使用**
+- **不引入 Pillow / OpenCV / 数据库 / Web 面板**
+- **默认单任务并发**，更适合 1C / 256MB~512MB 的 LXC
+- **自动清理只扫描机器人自己的临时目录**，避免高开销
 
 ---
 
 ## 目录结构
 
-```
-lxc-deploy/
-├── bot.py            # 机器人主程序（已适配 SESSION_DIR 环境变量）
-├── requirements.txt  # Python 依赖
-├── tgbot.env         # 环境变量模板（需填写 Token）
-├── tgbot.service     # systemd 服务单元
-├── install.sh        # 一键安装脚本
-└── uninstall.sh      # 卸载脚本
+```text
+lxc-deploy-V2/
+├── bot.py
+├── install.sh
+├── README.md
+├── requirements.txt
+├── tgbot.env
+├── tgbot.service
+└── uninstall.sh
 ```
 
 ---
 
-## 快速部署（推荐）
+## 功能说明
 
-### 第一步：准备 LXC 容器
+### 支持的输入
 
-在 Proxmox 中创建 LXC 容器：
+- 公开频道 / 群组消息链接
+- 支持格式：
+  - `https://t.me/channel_name/123`
+  - `https://t.me/s/channel_name/123`
 
-| 参数 | 推荐值 |
+### 支持的媒体类型
+
+单条消息支持：
+
+- 图片
+- 视频
+- 音频
+
+媒体组 / 相册优先支持：
+
+- 图片组
+- 视频组
+- 图片 + 视频混合组
+
+### 输出行为
+
+- 自动附加来源链接
+- 尽量隐藏原始来源
+- 能直发就直发，不能直发就下载重传
+- 视频优先保留原始缩略图
+- 没有可用缩略图时，可用 ffmpeg 本地抽帧
+
+---
+
+## 资源建议（适合 LXC）
+
+### 推荐最小配置
+
+| 项目 | 建议值 |
 |------|--------|
-| 模板 | Debian 12 / Ubuntu 22.04 |
-| CPU | 1 核（软限制 50%） |
-| 内存 | 256 MB（含 Swap 512MB 更稳） |
-| 磁盘 | 4 GB（足够） |
-| 网络 | 需要出网访问 Telegram API |
-| 特权容器 | 否（非特权更安全） |
+| CPU | 1 核 |
+| 内存 | 256MB 起，推荐 512MB |
+| Swap | 512MB |
+| 磁盘 | 6GB 起；若经常处理视频或媒体组，建议 8GB+ |
+| 网络 | 可访问 Telegram API |
 
-> **注意**：不需要开启 "嵌套虚拟化" 或任何特殊功能，普通非特权 LXC 即可。
+### 默认保守参数
 
-### 第二步：上传文件到 LXC 容器
+默认配置偏保守，目标不是极限吞吐，而是 **让小 LXC 更稳**：
 
-在宿主机（Proxmox）上执行，将 `lxc-deploy` 目录上传到容器（假设容器 ID 为 100）：
+- `MAX_CONCURRENT_JOBS=1`
+- `MAX_FILE_SIZE_MB=1024`
+- `MIN_FREE_SPACE_MB=256`
+- `MemoryMax=256M`
+- `CPUQuota=50%`
+
+---
+
+## 快速部署
+
+### 1）上传目录到容器
 
 ```bash
-# 方法 A：通过 pct push（Proxmox 原生）
-pct push 100 bot.py /root/tgbot/bot.py
-pct push 100 requirements.txt /root/tgbot/requirements.txt
-pct push 100 tgbot.env /root/tgbot/tgbot.env
-pct push 100 tgbot.service /root/tgbot/tgbot.service
-pct push 100 install.sh /root/tgbot/install.sh
-
-# 方法 B：通过 SCP（容器已开启 SSH）
-scp -r lxc-deploy/ root@<容器IP>:/root/tgbot/
+scp -r lxc-deploy-V2/ root@<容器IP>:/root/tgbot/
 ```
 
-### 第三步：进入容器并安装
+### 2）执行安装
 
 ```bash
-# 进入容器
-pct enter 100
-# 或通过 SSH
-ssh root@<容器IP>
-
-# 执行安装
 cd /root/tgbot
 chmod +x install.sh
 bash install.sh
 ```
 
-安装脚本会自动完成：
-- 安装 Python 3 + venv
-- 创建系统用户 `tgbot`（无 shell，更安全）
-- 创建 `/opt/tgbot`、`/var/lib/tgbot/sessions`、`/etc/tgbot` 目录
-- 安装 Python 依赖到虚拟环境
-- 注册并启用 systemd 服务
+如果你暂时不想安装 ffmpeg：
 
-### 第四步：填写配置
+```bash
+INSTALL_FFMPEG=0 bash install.sh
+```
+
+> 不装 ffmpeg 也能运行；只是当视频没有原始缩略图时，不能本地抽帧生成封面。
+
+### 3）填写配置
 
 ```bash
 nano /etc/tgbot/tgbot.env
 ```
 
-填写以下三项（必填）：
+至少填写：
 
 ```env
-BOT_TOKEN=123456789:ABCdef...   # 从 @BotFather 获取
-API_ID=12345678                  # 从 https://my.telegram.org/apps 获取
-API_HASH=abcdef1234567890...     # 同上
+BOT_TOKEN=123456789:ABCDEF...
+API_ID=12345678
+API_HASH=abcdef1234567890abcdef1234567890
 ```
 
-### 第五步：启动服务
+### 4）启动服务
 
 ```bash
 systemctl start tgbot
 systemctl status tgbot
 ```
 
+### 5）查看日志
+
+```bash
+journalctl -u tgbot -f
+```
+
 ---
 
-## 日常运维命令
+## 配置项说明
+
+### 必填项
+
+```env
+BOT_TOKEN=
+API_ID=
+API_HASH=
+```
+
+### 常用项
+
+```env
+SESSION_DIR=/var/lib/tgbot/sessions
+TEMP_DIR_BASE=/tmp/tgbot
+MAX_FILE_SIZE_MB=1024
+MAX_CONCURRENT_JOBS=1
+MIN_FREE_SPACE_MB=256
+ENABLE_FFMPEG_THUMB=1
+FFMPEG_BIN=ffmpeg
+FFMPEG_TIMEOUT_SEC=20
+LOG_LEVEL=INFO
+```
+
+### 新增的增强配置
+
+```env
+# 拉取媒体组时，向前向后搜索的消息窗口
+MEDIA_GROUP_WINDOW=12
+
+# 临时文件保留时长（分钟）
+TEMP_RETENTION_MINUTES=180
+
+# 后台自动清理扫描周期（分钟）
+CLEANUP_INTERVAL_MINUTES=30
+
+# 错误状态消息自动删除时间（秒）
+# 设为 0 表示不自动删除
+AUTO_DELETE_ERROR_SEC=120
+```
+
+### 调参建议
+
+- **超小 LXC**：保持默认即可
+- **磁盘较小**：把 `MAX_FILE_SIZE_MB` 调低到 `512`
+- **经常处理视频相册**：建议保留 `MIN_FREE_SPACE_MB=256` 或更高
+- **临时目录想更独立**：可改 `TEMP_DIR_BASE=/tmp/tgbot`
+- **不想自动删除错误消息**：设 `AUTO_DELETE_ERROR_SEC=0`
+- **不需要 ffmpeg 抽帧**：设 `ENABLE_FFMPEG_THUMB=0`
+
+---
+
+## 自动清理策略说明
+
+这版的自动清理主要清理的是：
+
+- 下载中的临时文件
+- 已完成任务留下的临时目录
+- 异常中断后遗留的旧任务目录
+- 过期错误状态消息（可配置）
+
+不会清理：
+
+- `SESSION_DIR` 会话文件
+- `/etc/tgbot/tgbot.env` 配置文件
+- systemd 日志
+
+所以它属于：
+
+> **只清理临时运行痕迹，不碰持久化配置和会话数据**
+
+---
+
+## systemd 服务说明
+
+服务文件：
+
+```text
+/etc/systemd/system/tgbot.service
+```
+
+这一版继续保留这些适合 LXC 的限制：
+
+- `User=tgbot`：低权限运行
+- `MemoryMax=256M`：限制最大内存
+- `CPUQuota=50%`：限制 CPU 占用
+- `TasksMax=64`：限制进程/线程数量
+- `PrivateTmp=true`：隔离临时目录
+- `ProtectSystem=strict`：系统目录只读
+- `ReadWritePaths=/var/lib/tgbot /tmp`：仅开放必要写入路径
+
+> 如果你修改了 `SESSION_DIR` 或 `TEMP_DIR_BASE` 到别的目录，请同步检查 service 的 `ReadWritePaths`。
+
+---
+
+## 日常运维
 
 ```bash
 # 查看实时日志
 journalctl -u tgbot -f
 
-# 查看最近 100 行日志
-journalctl -u tgbot -n 100
-
-# 重启服务
+# 重启
 systemctl restart tgbot
 
-# 停止服务
+# 停止
 systemctl stop tgbot
 
-# 查看资源占用
+# 查看状态
 systemctl status tgbot
-# 或
-ps aux | grep bot.py
 ```
 
 ---
 
-## 目录说明
+## 更新方式
 
-| 路径 | 用途 |
-|------|------|
-| `/opt/tgbot/` | 程序文件 + Python 虚拟环境 |
-| `/opt/tgbot/venv/` | Python 虚拟环境（隔离依赖） |
-| `/var/lib/tgbot/sessions/` | Telethon 会话文件（持久化） |
-| `/etc/tgbot/tgbot.env` | 环境变量配置（权限 600） |
-| `/etc/systemd/system/tgbot.service` | systemd 服务单元 |
-
----
-
-## 资源占用对比
-
-| 指标 | Docker 方案 | LXC 原生方案 |
-|------|-------------|-------------|
-| 内存基础占用 | ~80MB（Docker daemon） + 进程 | 仅进程本身 ~30MB |
-| 启动时间 | 10~30 秒 | <2 秒 |
-| 磁盘占用 | ~200MB（镜像） | ~50MB（venv） |
-| CPU 开销 | 有容器化损耗 | 接近原生 |
-| 自动重启 | docker restart policy | systemd Restart=on-failure |
-
----
-
-## 安全特性
-
-systemd 服务已启用以下沙箱保护：
-
-- `NoNewPrivileges=true` — 禁止提权
-- `PrivateTmp=true` — 独立 /tmp 命名空间
-- `ProtectSystem=strict` — 系统目录只读
-- `ProtectHome=true` — 禁止访问 /home
-- `User=tgbot` — 以低权限用户运行
-- `MemoryMax=256M` — 内存上限（同 Docker mem_limit）
-- `CPUQuota=50%` — CPU 限制（同 Docker cpus: 0.5）
-
----
-
-## 更新机器人
+如果你修改了程序：
 
 ```bash
-# 1. 上传新的 bot.py
-scp bot.py root@<容器IP>:/opt/tgbot/bot.py
-
-# 2. 修正文件权限
+cp bot.py /opt/tgbot/bot.py
 chown tgbot:tgbot /opt/tgbot/bot.py
+systemctl restart tgbot
+```
 
-# 3. 重启服务
+如果你修改了环境变量：
+
+```bash
+nano /etc/tgbot/tgbot.env
+systemctl restart tgbot
+```
+
+如果你修改了 service：
+
+```bash
+cp tgbot.service /etc/systemd/system/tgbot.service
+systemctl daemon-reload
 systemctl restart tgbot
 ```
 
@@ -175,33 +351,67 @@ systemctl restart tgbot
 ## 卸载
 
 ```bash
-bash /root/tgbot/uninstall.sh
-# 如需彻底删除数据：
+bash /opt/tgbot/uninstall.sh
+```
+
+卸载脚本会：
+
+- 停止服务
+- 删除 `/opt/tgbot`
+- 保留 `/var/lib/tgbot`
+- 保留 `/etc/tgbot`
+
+如需彻底删除：
+
+```bash
 rm -rf /var/lib/tgbot /etc/tgbot
 ```
 
 ---
 
-## 常见问题
+## 当前限制
 
-**Q: 提示 `python3-venv` 找不到？**  
-A: 手动运行 `apt-get install -y python3-venv` 后重新执行安装脚本。
+为了继续保持轻量，这一版仍然没有做一些会明显变重的能力：
 
-**Q: 服务启动失败，日志提示 `BOT_TOKEN` 未设置？**  
-A: 检查 `/etc/tgbot/tgbot.env` 是否已填写真实值，注意不要有多余空格。
+- 不支持 `t.me/c/...` 私有链接
+- 不引入数据库 / Web 后台 / 权限面板
+- 不做复杂的任务队列系统
+- 不做重型多媒体处理链路
 
-**Q: 会话文件在哪里？重装后还能用吗？**  
-A: 会话文件在 `/var/lib/tgbot/sessions/bot_session.session`，卸载脚本不会删除它，重装后自动复用。
+也就是说，它的定位依然是：
 
-**Q: 如何在多个 LXC 容器中运行多个 bot？**  
-A: 每个 bot 建一个独立 LXC 容器，或修改 `tgbot.service` 的 `User`、`WorkingDirectory` 和端口，为每个 bot 创建独立的 service 文件。
+> **一个适合小 LXC 长期运行、可维护、低依赖的 Telegram 媒体提取机器人**
 
 ---
 
-## 获取 API_ID 和 API_HASH
+## 依赖
 
-1. 访问 [https://my.telegram.org/apps](https://my.telegram.org/apps)
-2. 登录你的 Telegram 账号
-3. 点击「API development tools」
-4. 创建应用（名称随意）
-5. 复制 `App api_id` 和 `App api_hash`
+Python 依赖只有：
+
+```text
+telethon==1.37.0
+```
+
+系统依赖：
+
+- `python3`
+- `python3-venv`
+- `python3-pip`
+- `ffmpeg`（可选，但推荐）
+
+---
+
+## 总结
+
+这一版相对之前，重点是三件事：
+
+- **补上相册 / 媒体组支持**
+- **把错误提示做得更稳、更可读**
+- **加入自动清理策略，减少临时文件堆积**
+
+同时仍然尽量保持：
+
+- 代码简单
+- 依赖少
+- 运维容易
+- 对小规格 LXC 更友好
