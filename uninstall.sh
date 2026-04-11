@@ -1,8 +1,8 @@
 #!/bin/bash
-# 卸载脚本
+# Telegram File Extractor Bot V2 卸载脚本
 
 set -euo pipefail
-[[ $EUID -eq 0 ]] || { echo "请使用 root 运行"; exit 1; }
+[[ ${EUID} -eq 0 ]] || { echo "请使用 root 运行"; exit 1; }
 
 echo "正在停止并卸载 tgbot..."
 
@@ -13,10 +13,8 @@ systemctl daemon-reload
 
 rm -rf /opt/tgbot
 
-echo "保留数据目录 /var/lib/tgbot 和配置 /etc/tgbot（会话文件）"
+echo "已删除程序目录：/opt/tgbot"
+echo "已保留数据目录 /var/lib/tgbot 和配置目录 /etc/tgbot（含 session / env）"
 echo "如需彻底删除：rm -rf /var/lib/tgbot /etc/tgbot"
-
-# 删除用户（可选）
-# userdel tgbot
-
+echo "注意：本脚本不会卸载系统级 ffmpeg / python3，以免影响其他程序"
 echo "卸载完成。"
