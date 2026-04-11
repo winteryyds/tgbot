@@ -60,7 +60,7 @@ SUPPORTED_MEDIA_TYPES = {"photo", "video", "audio"}
 ALBUM_COMPATIBLE_MEDIA_TYPES = {"photo", "video"}
 CAPTION_TEXT_LIMIT = 850
 MAX_MEDIA_GROUP_ITEMS = 10
-DEFAULT_MAX_FILE_SIZE_MB = 1024
+DEFAULT_NOFORWARDS_MAX_FILE_SIZE_MB = 2048
 DEFAULT_MAX_CONCURRENT_JOBS = 1
 DEFAULT_FFMPEG_TIMEOUT_SEC = 20
 DEFAULT_MIN_FREE_SPACE_MB = 256
@@ -85,7 +85,7 @@ class Settings:
     api_hash: str
     session_dir: str
     temp_dir_base: str
-    max_file_size_bytes: int
+    noforwards_max_file_size_bytes: int
     max_concurrent_jobs: int
     min_free_space_bytes: int
     media_group_window: int
@@ -106,7 +106,7 @@ class Settings:
         api_hash = require_env("API_HASH")
         session_dir = os.environ.get("SESSION_DIR", "/var/lib/tgbot/sessions").strip() or "/var/lib/tgbot/sessions"
         temp_dir_base = os.environ.get("TEMP_DIR_BASE", "/tmp/tgbot").strip() or "/tmp/tgbot"
-        max_file_size_mb = max(1, env_int("MAX_FILE_SIZE_MB", DEFAULT_MAX_FILE_SIZE_MB))
+        noforwards_max_file_size_mb = max(1, env_int("NOFORWARDS_MAX_FILE_SIZE_MB", DEFAULT_NOFORWARDS_MAX_FILE_SIZE_MB))
         max_concurrent_jobs = max(1, env_int("MAX_CONCURRENT_JOBS", DEFAULT_MAX_CONCURRENT_JOBS))
         min_free_space_mb = max(64, env_int("MIN_FREE_SPACE_MB", DEFAULT_MIN_FREE_SPACE_MB))
         media_group_window = max(4, env_int("MEDIA_GROUP_WINDOW", DEFAULT_MEDIA_GROUP_WINDOW))
@@ -123,7 +123,7 @@ class Settings:
             api_hash=api_hash,
             session_dir=session_dir,
             temp_dir_base=temp_dir_base,
-            max_file_size_bytes=max_file_size_mb * 1024 * 1024,
+            noforwards_max_file_size_bytes=noforwards_max_file_size_mb * 1024 * 1024,
             max_concurrent_jobs=max_concurrent_jobs,
             min_free_space_bytes=min_free_space_mb * 1024 * 1024,
             media_group_window=media_group_window,
@@ -202,6 +202,12 @@ bot = TelegramClient(
 )
 JOB_SEMAPHORE = asyncio.Semaphore(SETTINGS.max_concurrent_jobs)
 BACKGROUND_TASKS = set()
+
+if os.environ.get("MAX_FILE_SIZE_MB", "").strip():
+    logger.warning(
+        "检测到旧配置 MAX_FILE_SIZE_MB：当前版本已不再对允许转发的资源做文件大小限制；"
+        "仅对禁止转发、必须下载重传的资源应用 NOFORWARDS_MAX_FILE_SIZE_MB。"
+    )
 
 
 def track_task(task):
@@ -378,18 +384,27 @@ def estimate_batch_total_size(messages: Sequence) -> tuple[int, bool]:
     return total, has_unknown
 
 
-def validate_batch_size_limit(batch: MediaBatch) -> None:
+def get_reupload_size_limit_bytes(no_forwards: bool) -> Optional[int]:
+    if not no_forwards:
+        return None
+    return SETTINGS.noforwards_max_file_size_bytes
+
+
+def validate_batch_size_limit(batch: MediaBatch, size_limit_bytes: Optional[int]) -> None:
+    if not size_limit_bytes or size_limit_bytes <= 0:
+        return
+
     for index, message in enumerate(batch.items, start=1):
         size = get_remote_file_size(message)
         if size is None:
             continue
-        if size > SETTINGS.max_file_size_bytes:
+        if size > size_limit_bytes:
             if batch.count > 1:
                 raise RuntimeError(
-                    f"媒体组第 {index} 项太大（{format_size(size)}），超过限制 {format_size(SETTINGS.max_file_size_bytes)}。"
+                    f"媒体组第 {index} 项太大（{format_size(size)}），超过下载重传限制 {format_size(size_limit_bytes)}。"
                 )
             raise RuntimeError(
-                f"文件太大（{format_size(size)}），超过限制 {format_size(SETTINGS.max_file_size_bytes)}。"
+                f"文件太大（{format_size(size)}），超过下载重传限制 {format_size(size_limit_bytes)}。"
             )
 
 
@@ -737,7 +752,15 @@ async def resolve_media_batch(entity, msg_id: int) -> MediaBatch:
     return MediaBatch(items=[anchor_message], is_group=False, skipped_unsupported=skipped_unsupported)
 
 
-async def download_single_item(status_msg, message, media_type: str, tmpdir: str, index: int, total: int) -> DownloadedMedia:
+async def download_single_item(
+    status_msg,
+    message,
+    media_type: str,
+    tmpdir: str,
+    index: int,
+    total: int,
+    size_limit_bytes: Optional[int],
+) -> DownloadedMedia:
     filename = get_original_filename(message, media_type)
     if total > 1:
         filename = f"{index:02d}_{filename}"
@@ -760,9 +783,9 @@ async def download_single_item(status_msg, message, media_type: str, tmpdir: str
     if file_size <= 0:
         raise RuntimeError("下载失败，文件大小为 0。")
 
-    if file_size > SETTINGS.max_file_size_bytes:
+    if size_limit_bytes and file_size > size_limit_bytes:
         raise RuntimeError(
-            f"文件太大（{format_size(file_size)}），超过限制 {format_size(SETTINGS.max_file_size_bytes)}。"
+            f"文件太大（{format_size(file_size)}），超过下载重传限制 {format_size(size_limit_bytes)}。"
         )
 
     return DownloadedMedia(
@@ -833,7 +856,13 @@ async def send_downloaded_items_individually(target_entity, status_msg, items: S
         await send_downloaded_single(target_entity, status_msg, item, item_caption, tmpdir)
 
 
-async def download_and_reupload_batch(target_entity, status_msg, batch: MediaBatch, caption: str) -> None:
+async def download_and_reupload_batch(
+    target_entity,
+    status_msg,
+    batch: MediaBatch,
+    caption: str,
+    size_limit_bytes: Optional[int],
+) -> None:
     with tempfile.TemporaryDirectory(prefix="job_", dir=SETTINGS.temp_dir_base) as tmpdir:
         estimated_total, has_unknown_size = estimate_batch_total_size(batch.items)
         if estimated_total > 0 and not has_unknown_size:
@@ -850,7 +879,15 @@ async def download_and_reupload_batch(target_entity, status_msg, batch: MediaBat
             if media_type not in SUPPORTED_MEDIA_TYPES:
                 raise RuntimeError("媒体组中存在暂不支持的项目，无法继续处理。")
             downloaded_items.append(
-                await download_single_item(status_msg, message, media_type, tmpdir, index=index, total=batch.count)
+                await download_single_item(
+                    status_msg,
+                    message,
+                    media_type,
+                    tmpdir,
+                    index=index,
+                    total=batch.count,
+                    size_limit_bytes=size_limit_bytes,
+                )
             )
 
         if len(downloaded_items) == 1:
@@ -911,22 +948,24 @@ async def process_public_link(event, chat_username: str, msg_id: int) -> None:
                 )
                 return
 
-            validate_batch_size_limit(batch)
-
-            original_text = get_batch_text(batch.items)
-            caption = build_caption(original_text, source_link)
             no_forwards = bool(
                 getattr(entity, "noforwards", False)
                 or any(bool(getattr(message, "noforwards", False)) for message in batch.items)
             )
+            size_limit_bytes = get_reupload_size_limit_bytes(no_forwards)
+            validate_batch_size_limit(batch, size_limit_bytes)
+
+            original_text = get_batch_text(batch.items)
+            caption = build_caption(original_text, source_link)
 
             logger.info(
-                "处理请求 chat=@%s msg_id=%s items=%s media_group=%s noforwards=%s",
+                "处理请求 chat=@%s msg_id=%s items=%s media_group=%s noforwards=%s reupload_limit=%s",
                 chat_username,
                 msg_id,
                 batch.count,
                 batch.is_group,
                 no_forwards,
+                format_size(size_limit_bytes) if size_limit_bytes else "none",
             )
 
             if not no_forwards:
@@ -936,7 +975,7 @@ async def process_public_link(event, chat_username: str, msg_id: int) -> None:
                     logger.info("处理完成（直发） chat=@%s msg_id=%s items=%s", chat_username, msg_id, batch.count)
                     return
 
-            await download_and_reupload_batch(target_entity, status_msg, batch, caption)
+            await download_and_reupload_batch(target_entity, status_msg, batch, caption, size_limit_bytes)
             await safe_delete(status_msg)
             logger.info("处理完成（下载重传） chat=@%s msg_id=%s items=%s", chat_username, msg_id, batch.count)
 
@@ -989,10 +1028,10 @@ async def message_router(event):
 if __name__ == "__main__":
     removed_on_startup = cleanup_stale_temp_entries()
     logger.info(
-        "Bot starting: session_dir=%s temp_dir=%s max_size=%s concurrency=%s ffmpeg=%s startup_cleanup=%s",
+        "Bot starting: session_dir=%s temp_dir=%s noforwards_max_size=%s concurrency=%s ffmpeg=%s startup_cleanup=%s",
         SETTINGS.session_dir,
         SETTINGS.temp_dir_base,
-        format_size(SETTINGS.max_file_size_bytes),
+        format_size(SETTINGS.noforwards_max_file_size_bytes),
         SETTINGS.max_concurrent_jobs,
         "enabled" if SETTINGS.enable_ffmpeg_thumb else "disabled",
         removed_on_startup,
