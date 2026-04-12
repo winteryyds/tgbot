@@ -364,6 +364,18 @@ def has_enough_free_space(path: str, expected_file_bytes: int) -> tuple[bool, in
     return usage.free >= required, usage.free
 
 
+def ensure_enough_free_space(path: str, expected_file_bytes: Optional[int]) -> None:
+    if not expected_file_bytes or expected_file_bytes <= 0:
+        return
+
+    enough, free_bytes = has_enough_free_space(path, expected_file_bytes)
+    if not enough:
+        raise RuntimeError(
+            f"磁盘剩余空间不足，当前可用 {format_size(free_bytes)}，"
+            f"至少需要 {format_size(expected_file_bytes + SETTINGS.min_free_space_bytes)}。"
+        )
+
+
 def batch_has_video(messages: Sequence) -> bool:
     return any(get_media_type(message) == "video" for message in messages)
 
@@ -856,6 +868,63 @@ async def send_downloaded_items_individually(target_entity, status_msg, items: S
         await send_downloaded_single(target_entity, status_msg, item, item_caption, tmpdir)
 
 
+async def send_preface_message(target_entity, text: str) -> None:
+    text = (text or "").strip()
+    if not text:
+        return
+    await bot.send_message(target_entity, text, parse_mode="html", link_preview=False)
+
+
+def cleanup_job_temp_files(tmpdir: str) -> None:
+    tmp_path = Path(tmpdir)
+    if not tmp_path.exists():
+        return
+
+    for entry in tmp_path.iterdir():
+        try:
+            if entry.is_dir():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            logger.debug("清理任务临时文件失败：%s (%s)", entry, exc)
+
+
+async def download_and_send_group_sequentially(
+    target_entity,
+    status_msg,
+    batch: MediaBatch,
+    preface_text: str,
+    size_limit_bytes: Optional[int],
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="job_", dir=SETTINGS.temp_dir_base) as tmpdir:
+        await safe_edit(status_msg, "📝 正在发送当前媒体组说明...")
+        await send_preface_message(target_entity, preface_text)
+
+        for index, message in enumerate(batch.items, start=1):
+            media_type = get_media_type(message)
+            if media_type not in SUPPORTED_MEDIA_TYPES:
+                raise RuntimeError("媒体组中存在暂不支持的项目，无法继续处理。")
+
+            ensure_enough_free_space(tmpdir, get_remote_file_size(message))
+            item = await download_single_item(
+                status_msg,
+                message,
+                media_type,
+                tmpdir,
+                index=index,
+                total=batch.count,
+                size_limit_bytes=size_limit_bytes,
+            )
+
+            try:
+                await send_downloaded_single(target_entity, status_msg, item, "", tmpdir)
+            finally:
+                cleanup_job_temp_files(tmpdir)
+
+
 async def download_and_reupload_batch(
     target_entity,
     status_msg,
@@ -866,12 +935,7 @@ async def download_and_reupload_batch(
     with tempfile.TemporaryDirectory(prefix="job_", dir=SETTINGS.temp_dir_base) as tmpdir:
         estimated_total, has_unknown_size = estimate_batch_total_size(batch.items)
         if estimated_total > 0 and not has_unknown_size:
-            enough, free_bytes = has_enough_free_space(tmpdir, estimated_total)
-            if not enough:
-                raise RuntimeError(
-                    f"磁盘剩余空间不足，当前可用 {format_size(free_bytes)}，"
-                    f"至少需要 {format_size(estimated_total + SETTINGS.min_free_space_bytes)}。"
-                )
+            ensure_enough_free_space(tmpdir, estimated_total)
 
         downloaded_items = []
         for index, message in enumerate(batch.items, start=1):
@@ -902,8 +966,12 @@ async def download_and_reupload_batch(
         await send_downloaded_items_individually(target_entity, status_msg, downloaded_items, caption, tmpdir)
 
 
-def build_group_notice(batch: MediaBatch) -> str:
-    base = f"🧩 检测到媒体组，共 {batch.count} 项，正在处理..."
+def build_group_notice(batch: MediaBatch, sequential_reupload: bool = False) -> str:
+    if sequential_reupload:
+        base = f"🧩 检测到禁止转发媒体组，共 {batch.count} 项，将先发送说明，再按顺序逐条下载并发送。"
+    else:
+        base = f"🧩 检测到媒体组，共 {batch.count} 项，正在处理..."
+
     if batch.skipped_unsupported > 0:
         base += f"\n⚠️ 其中 {batch.skipped_unsupported} 项不是当前支持的媒体，已自动跳过。"
     return base
@@ -938,9 +1006,6 @@ async def process_public_link(event, chat_username: str, msg_id: int) -> None:
                 await show_error(status_msg, "找不到该消息，请检查链接是否正确。")
                 return
 
-            if batch.is_group:
-                await safe_edit(status_msg, build_group_notice(batch))
-
             if all(get_media_type(message) is None for message in batch.items):
                 await show_error(
                     status_msg,
@@ -954,6 +1019,9 @@ async def process_public_link(event, chat_username: str, msg_id: int) -> None:
             )
             size_limit_bytes = get_reupload_size_limit_bytes(no_forwards)
             validate_batch_size_limit(batch, size_limit_bytes)
+
+            if batch.is_group:
+                await safe_edit(status_msg, build_group_notice(batch, sequential_reupload=no_forwards))
 
             original_text = get_batch_text(batch.items)
             caption = build_caption(original_text, source_link)
@@ -974,6 +1042,12 @@ async def process_public_link(event, chat_username: str, msg_id: int) -> None:
                     await safe_delete(status_msg)
                     logger.info("处理完成（直发） chat=@%s msg_id=%s items=%s", chat_username, msg_id, batch.count)
                     return
+
+            if no_forwards and batch.is_group:
+                await download_and_send_group_sequentially(target_entity, status_msg, batch, caption, size_limit_bytes)
+                await safe_delete(status_msg)
+                logger.info("处理完成（顺序下载重传） chat=@%s msg_id=%s items=%s", chat_username, msg_id, batch.count)
+                return
 
             await download_and_reupload_batch(target_entity, status_msg, batch, caption, size_limit_bytes)
             await safe_delete(status_msg)
